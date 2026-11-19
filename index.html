@@ -5164,3 +5164,81 @@
       });
     })();
   </script>
+  <script>
+    (function() {
+      var lastGeminiErr = "";
+
+      callGeminiAPI = async function(contentsOrParts, systemInstruction, tempVal) {
+        var isMultiTurn = Array.isArray(contentsOrParts) && contentsOrParts.length > 0 && contentsOrParts[0].role;
+        var contentsPayload = isMultiTurn ? contentsOrParts : [{ role: "user", parts: contentsOrParts }];
+        var apiKey = (localStorage.getItem(KEYS.GEMINI_KEY) || window.RNS_CLOUD_GEMINI_KEY || "").replace(/\s+/g, "");
+        if (!apiKey) {
+          lastGeminiErr = "API Key खाली है—कृपया पहले Save Key दबाएं।";
+          return null;
+        }
+
+        var models = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-1.5-flash"];
+        var body = {
+          contents: contentsPayload,
+          generationConfig: { temperature: (typeof tempVal === "number") ? tempVal : 0.4, maxOutputTokens: 900 }
+        };
+        if (systemInstruction) body.systemInstruction = { parts: [{ text: systemInstruction }] };
+
+        lastGeminiErr = "";
+        for (var i = 0; i < models.length; i++) {
+          try {
+            var url = "https://generativelanguage.googleapis.com/v1beta/models/" + models[i] + ":generateContent?key=" + encodeURIComponent(apiKey);
+            var res = await fetchWithTimeout(url, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(body)
+            }, 35000);
+            var json = await res.json().catch(function() { return {}; });
+            if (res.ok) {
+              var txt = json.candidates && json.candidates[0] && json.candidates[0].content && json.candidates[0].content.parts
+                ? json.candidates[0].content.parts.map(function(p) { return p.text || ""; }).join("")
+                : "";
+              if (txt) return txt;
+            } else {
+              var msg = (json && json.error && json.error.message) ? json.error.message : ("HTTP " + res.status);
+              lastGeminiErr = models[i] + " → " + msg;
+            }
+          } catch (e) {
+            lastGeminiErr = models[i] + " → " + (e.message || "Network Error");
+          }
+        }
+        var logEl = document.getElementById("ownerAiStatusLog");
+        if (logEl && lastGeminiErr) logEl.textContent = "❌ Google Error: " + lastGeminiErr;
+        return null;
+      };
+
+      window.testGeminiKeyNow = async function() {
+        var logEl = document.getElementById("ownerAiStatusLog");
+        if (logEl) logEl.textContent = "🧪 Gemini Key टेस्ट हो रही है...";
+        var out = await callGeminiAPI([{ text: "Reply with just: OK" }], "", 0.1);
+        if (out) {
+          if (logEl) logEl.textContent = "✅ बधाई हो! Gemini API Key 100% काम कर रही है।";
+          showToast("✅ Gemini Key 100% सही काम कर रही है!");
+        } else {
+          if (logEl) logEl.textContent = "❌ Key Error: " + (lastGeminiErr || "Unknown Error");
+          showToast("❌ Error: " + (lastGeminiErr || "Key check failed"), "error");
+        }
+      };
+
+      window.addEventListener("DOMContentLoaded", function() {
+        var keyInp = document.getElementById("ownerGeminiKey");
+        if (keyInp && keyInp.parentElement && !document.getElementById("btnTestGemKey")) {
+          var b = document.createElement("button");
+          b.id = "btnTestGemKey";
+          b.type = "button";
+          b.className = "btn-outline";
+          b.style.cssText = "padding:7px 10px; font-size:11.5px;";
+          b.textContent = "🧪 Test Key";
+          b.onclick = window.testGeminiKeyNow;
+          keyInp.parentElement.appendChild(b);
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
