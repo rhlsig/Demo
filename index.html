@@ -4266,17 +4266,12 @@
 <!-- ===== PART 4 START ===== -->
   <script>
     /* =========================================================================
-       10. INBUILT GEMINI AI ENGINE (X-goog-api-key + MULTI-MODEL AUTO-FALLBACK)
+       10. GROQ AI ENGINE (LIVE MODEL AUTO-FALLBACK + 3-PHOTO VISION + CLOUD KEY)
        ========================================================================= */
-    var INBUILT_GEMINI_KEY = [
-      "AQ.Ab8RN6LiCo0b49",
-      "_yyx-5IXnH8wrBQw",
-      "XXH3dJ0pDNMrH5I-fqsQ"
-    ].join("");
-
-    window.RNS_CLOUD_GEMINI_KEY = window.RNS_CLOUD_GEMINI_KEY || INBUILT_GEMINI_KEY;
-    var lastGeminiErr = "";
-    var lastGeminiModelUsed = "";
+    window.RNS_CLOUD_GEMINI_KEY = window.RNS_CLOUD_GEMINI_KEY || "";
+    var lastAiErr = "";
+    var lastAiModelUsed = "";
+    var groqLiveModelsCache = null;
 
     function escJsStr(s) {
       return String(s === undefined || s === null ? "" : s)
@@ -4286,115 +4281,203 @@
         .replace(/\r?\n/g, " ");
     }
 
-    function getActiveGeminiKey() {
-      var saved = (localStorage.getItem(KEYS.GEMINI_KEY) || "").replace(/\s+/g, "");
-      if (saved) return saved;
-      var cloudK = (window.RNS_CLOUD_GEMINI_KEY || "").replace(/\s+/g, "");
-      if (cloudK) return cloudK;
-      return INBUILT_GEMINI_KEY;
+    function normalizeGroqKey(k) {
+      return String(k || "").replace(/\s+/g, "").replace(/^gsk_/i, "gsk_");
+    }
+
+    function getActiveAIKey() {
+      var saved = normalizeGroqKey(localStorage.getItem(KEYS.GEMINI_KEY));
+      if (saved && saved.indexOf("gsk_") === 0) return saved;
+      var cloudK = normalizeGroqKey(window.RNS_CLOUD_GEMINI_KEY);
+      if (cloudK && cloudK.indexOf("gsk_") === 0) return cloudK;
+      return "";
     }
 
     async function saveGeminiApiKey() {
       var keyInp = document.getElementById("ownerGeminiKey");
-      var val = (keyInp ? keyInp.value : "").replace(/\s+/g, "");
+      var val = normalizeGroqKey(keyInp ? keyInp.value : "");
+      if (keyInp) keyInp.value = val;
+
       if (!val) {
         localStorage.removeItem(KEYS.GEMINI_KEY);
-        window.RNS_CLOUD_GEMINI_KEY = INBUILT_GEMINI_KEY;
+        window.RNS_CLOUD_GEMINI_KEY = "";
+        groqLiveModelsCache = null;
         await awDeleteRow("cfg_ai").catch(function() {});
-        return showToast("🔑 कस्टम Key हटा दी गई—अब Inbuilt Gemini Key एक्टिव है।");
+        return showToast("🔑 Groq AI Key हटा दी गई।", "warn");
       }
+
+      if (val.indexOf("gsk_") !== 0) {
+        return showToast("⚠️ कृपया सही Groq API Key डालें (जो gsk_ से शुरू होती है)।", "error");
+      }
+
       localStorage.setItem(KEYS.GEMINI_KEY, val);
       window.RNS_CLOUD_GEMINI_KEY = val;
+      groqLiveModelsCache = null;
+
       try {
-        await awUpsertRow("cfg_ai", "ai_cfg", { k: val, updatedAt: Date.now() });
-        showToast("✅ नई Gemini Key सेव और Appwrite Cloud पर सिंक हो गई!");
+        await awUpsertRow("cfg_ai", "ai_cfg", { k: val, provider: "groq", updatedAt: Date.now() });
+        showToast("✅ Groq AI Key Appwrite Cloud पर सेव हो गई! अब 3-Photo Scanner और सभी ग्राहकों का AI चालू है।");
       } catch (e) {
-        showToast("🔑 Key लोकल में सेव हो गई।", "warn");
+        showToast("🔑 Key लोकल में सेव हो गई (क्लाउड सिंक के लिए इंटरनेट जांचें)।", "warn");
       }
     }
 
-    async function callGeminiAPI(contentsOrParts, systemInstruction, tempVal) {
-      var isMultiTurn = Array.isArray(contentsOrParts) && contentsOrParts.length > 0 && contentsOrParts[0].role;
-      var contentsPayload = isMultiTurn ? contentsOrParts : [{ role: "user", parts: contentsOrParts }];
-      var apiKey = getActiveGeminiKey();
+    async function discoverGroqModels(apiKey) {
+      if (Array.isArray(groqLiveModelsCache) && groqLiveModelsCache.length > 0) {
+        return groqLiveModelsCache;
+      }
+      try {
+        var r = await fetchWithTimeout("https://api.groq.com/openai/v1/models", {
+          method: "GET",
+          headers: { "Authorization": "Bearer " + apiKey }
+        }, 10000);
+        if (r.ok) {
+          var j = await r.json();
+          if (j && Array.isArray(j.data)) {
+            groqLiveModelsCache = j.data
+              .map(function(m) { return m.id || ""; })
+              .filter(function(id) {
+                return id && !/whisper|tts|guard|safeguard|prompt-guard|orpheus/i.test(id);
+              });
+            return groqLiveModelsCache;
+          }
+        }
+      } catch (e) {}
+      return [];
+    }
+
+    async function callGroqAI(turnsOrParts, systemInstruction, tempVal) {
+      var isMultiTurn = Array.isArray(turnsOrParts) && turnsOrParts.length > 0 && turnsOrParts[0].role;
+      var turns = isMultiTurn ? turnsOrParts : [{ role: "user", parts: turnsOrParts }];
+      var apiKey = getActiveAIKey();
+
+      // Auto-fetch key from Appwrite Cloud once for first-time customers
       if (!apiKey) {
-        lastGeminiErr = "API Key खाली है।";
+        await syncFromCloud().catch(function() {});
+        apiKey = getActiveAIKey();
+      }
+
+      if (!apiKey) {
+        lastAiErr = "AI Key सेट नहीं है—कृपया Owner Portal → AI Inventory में अपनी Groq Key (gsk_...) सेव करें।";
         return null;
       }
 
-      var body = {
-        contents: contentsPayload,
-        generationConfig: {
-          temperature: (typeof tempVal === "number") ? tempVal : 0.45,
-          maxOutputTokens: 1400
-        }
-      };
-      if (systemInstruction) {
-        body.systemInstruction = { parts: [{ text: systemInstruction }] };
+      var hasImages = turns.some(function(t) {
+        return Array.isArray(t.parts) && t.parts.some(function(p) { return p && p.inlineData && p.inlineData.data; });
+      });
+
+      var messages = [];
+      if (systemInstruction && !hasImages) {
+        messages.push({ role: "system", content: systemInstruction });
       }
 
-      // Multi-Model Auto-Fallback: prevents "high demand" / 503 / 429 interruptions
-      var models = [
-        "gemini-flash-latest",
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-lite"
-      ];
+      turns.forEach(function(t, idx) {
+        var role = (t.role === "model" || t.role === "assistant") ? "assistant" : "user";
+        var parts = Array.isArray(t.parts) ? t.parts : [];
 
-      lastGeminiErr = "";
-      lastGeminiModelUsed = "";
+        if (hasImages) {
+          var contentArr = [];
+          if (idx === 0 && systemInstruction) {
+            contentArr.push({ type: "text", text: systemInstruction + "\n\n" });
+          }
+          parts.forEach(function(p) {
+            if (p && p.text) {
+              contentArr.push({ type: "text", text: p.text });
+            } else if (p && p.inlineData && p.inlineData.data) {
+              var mime = p.inlineData.mimeType || "image/jpeg";
+              contentArr.push({
+                type: "image_url",
+                image_url: { url: "data:" + mime + ";base64," + p.inlineData.data }
+              });
+            }
+          });
+          if (contentArr.length > 0) messages.push({ role: role, content: contentArr });
+        } else {
+          var joinedText = parts.map(function(p) { return (p && p.text) ? p.text : ""; }).join("\n").trim();
+          if (joinedText) messages.push({ role: role, content: joinedText });
+        }
+      });
 
-      for (var i = 0; i < models.length; i++) {
-        var modelName = models[i];
+      var candidateModels = hasImages
+        ? [
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+            "meta-llama/llama-4-maverick-17b-128e-instruct"
+          ]
+        : [
+            "llama-3.3-70b-versatile",
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+            "llama-3.1-8b-instant"
+          ];
+
+      var liveList = await discoverGroqModels(apiKey);
+      if (liveList.length > 0) {
+        liveList.forEach(function(id) {
+          if (candidateModels.indexOf(id) !== -1) return;
+          if (hasImages && /llama-4|vision/i.test(id)) candidateModels.push(id);
+          else if (!hasImages && /llama|qwen|gpt-oss|gemma/i.test(id)) candidateModels.push(id);
+        });
+      }
+
+      lastAiErr = "";
+      lastAiModelUsed = "";
+      var errLog = [];
+
+      for (var i = 0; i < candidateModels.length; i++) {
+        var modelName = candidateModels[i];
         try {
-          var url = "https://generativelanguage.googleapis.com/v1beta/models/" + modelName + ":generateContent";
-          var res = await fetchWithTimeout(url, {
+          var res = await fetchWithTimeout("https://api.groq.com/openai/v1/chat/completions", {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              "X-goog-api-key": apiKey
+              "Authorization": "Bearer " + apiKey
             },
-            body: JSON.stringify(body)
-          }, 28000);
+            body: JSON.stringify({
+              model: modelName,
+              messages: messages,
+              temperature: (typeof tempVal === "number") ? tempVal : 0.45,
+              max_tokens: 1500
+            })
+          }, 26000);
 
           var json = await res.json().catch(function() { return {}; });
           if (res.ok) {
-            var txt = json.candidates && json.candidates[0] && json.candidates[0].content && json.candidates[0].content.parts
-              ? json.candidates[0].content.parts.map(function(p) { return p.text || ""; }).join("")
+            var txt = json.choices && json.choices[0] && json.choices[0].message && json.choices[0].message.content
+              ? String(json.choices[0].message.content).replace(/<think>[\s\S]*?<\/think>/gi, "").trim()
               : "";
             if (txt) {
-              lastGeminiModelUsed = modelName;
+              lastAiModelUsed = modelName;
               return txt;
             }
           } else {
-            lastGeminiErr = (json && json.error && json.error.message) ? json.error.message : ("HTTP " + res.status);
-            // If key itself is invalid (401/403), no need to retry other models
+            var eMsg = (json && json.error && json.error.message) ? json.error.message : ("HTTP " + res.status);
+            errLog.push(modelName + ": " + eMsg);
             if (res.status === 401 || res.status === 403) break;
-            // Brief wait before switching to fallback model on high demand (429/503)
             if (res.status === 429 || res.status === 503) {
               await new Promise(function(r) { setTimeout(r, 450); });
             }
           }
         } catch (e) {
-          lastGeminiErr = e.message || "Network Error";
+          errLog.push(modelName + ": " + (e.message || "Network Error"));
         }
       }
 
+      lastAiErr = errLog[0] || "Groq AI से संपर्क नहीं हो पाया।";
       return null;
     }
 
     async function testGeminiKeyNow() {
       var logEl = document.getElementById("ownerAiStatusLog");
-      if (logEl) logEl.textContent = "🧪 Gemini AI (Auto-Fallback) टेस्ट हो रहा है...";
-      var out = await callGeminiAPI([{ text: "Reply with just: OK" }], "", 0.1);
+      groqLiveModelsCache = null;
+      if (logEl) logEl.textContent = "🧪 Groq AI Key और लाइव मॉडल टेस्ट हो रहे हैं...";
+      var out = await callGroqAI([{ text: "Reply with just: OK" }], "", 0.1);
       if (out) {
-        var msg = "✅ बधाई हो! Gemini AI 100% चालू है (" + (lastGeminiModelUsed || "gemini-flash-latest") + ")";
-        if (logEl) logEl.textContent = msg;
-        showToast(msg);
+        var okMsg = "✅ बधाई हो! Groq AI 100% चालू है (Model: " + (lastAiModelUsed || "Groq") + ") — Customer AI और 3-Photo Scanner दोनों एक्टिव हैं!";
+        if (logEl) logEl.textContent = okMsg;
+        showToast(okMsg);
       } else {
-        if (logEl) logEl.textContent = "❌ Google Error: " + (lastGeminiErr || "Unknown Error");
-        showToast("❌ Error: " + (lastGeminiErr || "Key check failed"), "error");
+        var failMsg = "❌ Groq Error: " + (lastAiErr || "Unknown Error");
+        if (logEl) logEl.textContent = failMsg;
+        showToast(failMsg, "error");
       }
     }
 
@@ -4446,12 +4529,11 @@
       try {
         var parts = [{
           text:
-            "You are an expert Indian Pharmacy Inventory OCR specialist. Carefully examine ALL attached photos of this medicine (Front, Back, and/or Side/Flap). " +
-            "Often Batch No., Expiry Date, MRP, or Marketing Company is printed on the side flap or strip edge—read every visible angle accurately. " +
-            "Return ONLY valid raw JSON (no markdown code fences) with these exact keys: " +
+            "You are an expert Indian Pharmacy Inventory OCR specialist. Carefully inspect ALL attached photos of this medicine (Front, Back, and/or Side/Flap). " +
+            "Batch No., Expiry Date, MRP, or Marketing Company may be printed on the side flap or strip edge—read every visible angle accurately. " +
+            "Return ONLY valid raw JSON (no markdown code fences, no extra explanation) with these exact keys: " +
             "{\"name\":\"\",\"generic\":\"\",\"category\":\"\",\"company\":\"\",\"pack\":\"\",\"batch\":\"\",\"exp\":\"\",\"mrp\":0,\"summary\":\"\"}. " +
-            "For 'category', pick EXACTLY ONE key from this list based on the medicine's therapeutic use/salt: " +
-            "FEVER_PAIN, COUGH_COLD, GASTRIC, VITAMINS, ANTIBIOTICS, SUGAR_BP, SYRUP, DROPS_GELS, OTHER. " +
+            "For 'category', pick EXACTLY ONE key from: FEVER_PAIN, COUGH_COLD, GASTRIC, VITAMINS, ANTIBIOTICS, SUGAR_BP, SYRUP, DROPS_GELS, OTHER. " +
             "Rules: name = Brand/Product Name with strength; generic = exact Salt/Composition; company = Marketed By / Manufactured By; " +
             "pack = packing size (e.g. Strip of 15 Tablets / 100ml Bottle); batch = Batch No.; exp = Expiry Date (MM/YYYY); mrp = numeric MRP in INR; " +
             "summary = 1 short Hindi line stating what was read."
@@ -4465,20 +4547,21 @@
 
         for (var i = 0; i < labeledFiles.length; i++) {
           if (!labeledFiles[i].file) continue;
-          var comp = await compressImageToBlobAndDataUrl(labeledFiles[i].file, 1400, 0.85);
+          // 960px @ 0.72 quality keeps OCR sharp while staying well below Groq's 4MB payload limit for 3 photos
+          var comp = await compressImageToBlobAndDataUrl(labeledFiles[i].file, 960, 0.72);
           parts.push({ text: labeledFiles[i].label });
           parts.push({ inlineData: { mimeType: "image/jpeg", data: comp.dataUrl.split(",")[1] } });
         }
 
-        var aiResp = await callGeminiAPI(parts, "Extract accurate Indian pharmacy medicine strip/box details and output ONLY raw JSON.", 0.15);
-        if (!aiResp) throw new Error(lastGeminiErr || "Gemini AI से जवाब नहीं मिला—कृपया इंटरनेट जांचें।");
+        var aiResp = await callGroqAI(parts, "Extract accurate Indian pharmacy medicine strip/box details and output ONLY raw JSON.", 0.1);
+        if (!aiResp) throw new Error(lastAiErr || "Groq AI से जवाब नहीं मिला—कृपया Key और इंटरनेट जांचें।");
 
         var jsonMatch = aiResp.match(/\{[\s\S]*\}/);
         var parsed = jsonMatch ? safeJsonParse(jsonMatch[0], null) : null;
         if (!parsed) throw new Error("फोटो के अक्षर स्पष्ट नहीं पढ़े जा सके—कृपया साफ़ रोशनी में फोटो लें।");
 
         fillInventoryFormFromObj(parsed);
-        logEl.textContent = "✅ " + (parsed.summary || "तीनों फोटो से सारी डिटेल व कैटेगरी ऑटो-फिल हो गई!") + " कृपया चेक करके '💾 Save & Cloud Sync' दबाएं (सेव करते ही फोटो ऑटो-डिलीट हो जाएंगी)।";
+        logEl.textContent = "✅ " + (parsed.summary || "तीनों फोटो से सारी डिटेल व कैटेगरी ऑटो-फिल हो गई!") + " कृपया चेक करके '💾 Save & Cloud Sync' दबाएं (सेव करते ही तीनों फोटो ऑटो-डिलीट हो जाएंगी)।";
         showToast("✨ 3-Photo AI स्कैन पूरा—फॉर्म और कैटेगरी ऑटो-फिल हो गए!");
         var nameField = document.getElementById("medName");
         if (nameField) nameField.focus();
@@ -4499,9 +4582,9 @@
       logEl.textContent = "🤖 AI टेक्स्ट पढ़कर फॉर्म और कैटेगरी भर रहा है...";
       var parsed = null;
 
-      var resp = await callGeminiAPI([{
-        text: "Parse this Indian medicine inventory note into raw JSON with exact keys {\"name\":\"\",\"generic\":\"\",\"category\":\"\",\"company\":\"\",\"pack\":\"\",\"batch\":\"\",\"exp\":\"\",\"mrp\":0,\"stock\":20}. For category choose one of: FEVER_PAIN, COUGH_COLD, GASTRIC, VITAMINS, ANTIBIOTICS, SUGAR_BP, SYRUP, DROPS_GELS, OTHER. Infer standard generic salt & company if famous Indian brand. Input: " + cmd
-      }], "Return only valid raw JSON.", 0.15);
+      var resp = await callGroqAI([{
+        text: "Parse this Indian medicine inventory note into raw JSON ONLY with exact keys {\"name\":\"\",\"generic\":\"\",\"category\":\"\",\"company\":\"\",\"pack\":\"\",\"batch\":\"\",\"exp\":\"\",\"mrp\":0,\"stock\":20}. For category choose one of: FEVER_PAIN, COUGH_COLD, GASTRIC, VITAMINS, ANTIBIOTICS, SUGAR_BP, SYRUP, DROPS_GELS, OTHER. Infer standard generic salt & company if famous Indian brand. Input: " + cmd
+      }], "Return ONLY valid raw JSON.", 0.15);
 
       var m = resp ? resp.match(/\{[\s\S]*\}/) : null;
       if (m) parsed = safeJsonParse(m[0], null);
@@ -4532,7 +4615,7 @@
     }
 
     /* =========================================================================
-       12. CUSTOMER GEMINI AI ASSISTANT (A-TO-Z MEDICINE INFO + NAME CONFIRM + PRIVACY)
+       12. CUSTOMER AI PHARMACIST (A-TO-Z MEDICINE GUIDE + CONFIRM + PRIVACY)
        ========================================================================= */
     var INDIAN_MED_DB = [
       { keys: ["dolo", "dolo 650", "paracetamol", "calpol", "crocin", "p 650", "pacimol"], brand: "Dolo 650 / Paracetamol", salt: "Paracetamol IP 650mg", company: "Micro Labs Ltd", pack: "Strip of 15 Tablets" },
@@ -4566,7 +4649,7 @@
     ];
 
     var aiInitialized = false;
-    var aiGeminiTurns = [];
+    var aiChatTurns = [];
     var aiLastMedContext = null;
     var pendingMedConfirm = null;
     var aiSpeechRec = null;
@@ -4589,7 +4672,7 @@
     }
 
     function resetCustomerAiChat() {
-      aiGeminiTurns = [];
+      aiChatTurns = [];
       aiLastMedContext = null;
       pendingMedConfirm = null;
       aiInitialized = false;
@@ -4608,7 +4691,7 @@
       return div;
     }
 
-    function formatGeminiMarkdownToHtml(rawText) {
+    function formatAiMarkdownToHtml(rawText) {
       var safe = escHtml(rawText || "");
       safe = safe.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
       safe = safe.replace(/`([^`]+)`/g, "<code>$1</code>");
@@ -4620,7 +4703,7 @@
     function initCustomerAiWelcome() {
       aiInitialized = true;
       appendAiBubble("bot",
-        'नमस्ते! 🙏 <strong>RNS PHARMACY</strong> के स्मार्ट AI Pharmacist में आपका स्वागत है। आप हिंदी, इंग्लिश या हिंग्लिश में लिखकर या माइक से बोलकर किसी भी दवा की <strong>A-to-Z जानकारी (Uses, Side Effects, Precautions)</strong>, ऑर्डर या हेल्थ सवाल पूछ सकते हैं!' +
+        'नमस्ते! 🙏 <strong>RNS PHARMACY</strong> के स्मार्ट AI Pharmacist में आपका स्वागत है। आप हिंदी, इंग्लिश या हिंग्लिश में लिखकर या माइक 🎤 से बोलकर किसी भी दवा की <strong>A-to-Z जानकारी (Uses, Side Effects, Precautions)</strong>, ऑर्डर या हेल्थ सवाल पूछ सकते हैं!' +
         '<div class="ai-quick-chips">' +
           '<button type="button" class="ai-chip" onclick="aiQuickAction(\'new_order\')">🛒 दवा ऑर्डर करें</button>' +
           '<button type="button" class="ai-chip" onclick="aiQuickAction(\'med_info\')">💊 दवा की A-to-Z जानकारी</button>' +
@@ -4935,7 +5018,7 @@
 
       var low = rawText.toLowerCase();
 
-      // 0. Handle typed Yes/No when a medicine confirmation is pending
+      // 0. Handle typed Yes/No when medicine confirmation is pending
       if (pendingMedConfirm) {
         if (/^(haan|han|ha|yes|ji|ji haan|yahi|sahi|ok|okay|हाँ|हां|जी|जी हाँ|यही|सही)$/i.test(low)) {
           aiConfirmMedicineChoice(true);
@@ -4949,12 +5032,12 @@
 
       appendAiBubble("user", escHtml(rawText));
 
-      // 1. STRICT PRIVACY GUARD: Promo Codes & Internal Owner/System Details
+      // 1. STRICT PRIVACY GUARD (PROMO CODES, STOCK COUNTS, PIN, API KEY, INTERNAL DATA)
       if (/(promo\s*code|coupon|discount\s*code|secret\s*code|offer\s*code|प्रोमो\s*कोड|कूपन|डिस्काउंट\s*कोड)/i.test(rawText)) {
-        appendAiBubble("bot", "प्रोमो कोड केवल योग्य ग्राहकों को सीधे WhatsApp पर भेजे जाते हैं—आप हमारी सभी दवाइयों पर पहले से मौजूद शानदार ऑफर प्राइस पर सीधे ऑर्डर कर सकते हैं! 😊");
+        appendAiBubble("bot", "प्रोमो कोड केवल योग्य ग्राहकों को सीधे WhatsApp पर भेजे जाते हैं, आप हमारे ऑफर प्राइस पर सीधे ऑर्डर कर सकते हैं। 😊");
         return;
       }
-      if (/(owner\s*pin|admin\s*pin|admin\s*pass|7402|api\s*key|gemini\s*key|appwrite|total\s*sales|kitna\s*piece|kitne\s*piece|kitne\s*pcs|stock\s*count|कितने\s*पीस)/i.test(rawText)) {
+      if (/(owner\s*pin|admin\s*pin|admin\s*pass|7402|api\s*key|groq\s*key|gemini\s*key|appwrite|total\s*sales|kitna\s*piece|kitne\s*piece|kitne\s*pcs|stock\s*count|कितने\s*पीस)/i.test(rawText)) {
         appendAiBubble("bot", "माफ़ कीजिएगा जी, स्टोर की अंदरूनी जानकारी और स्टॉक की सटीक गिनती सुरक्षा कारणों से गोपनीय रखी जाती है। आप किसी भी दवा का नाम पूछें—मैं बता दूँगा कि वह उपलब्ध है या नहीं!");
         return;
       }
@@ -4998,79 +5081,78 @@
         return;
       }
 
-      // 4. FULL GOOGLE GEMINI AI CONVERSATION (MULTILINGUAL + A-TO-Z MEDICINE GUIDE + CONFIRMATION TAGS)
-      var typingEl = appendAiBubble("bot", "✨ RNS AI Pharmacist सोच रहा है...");
+      // 4. FULL GROQ AI CONVERSATION (MULTILINGUAL + A-TO-Z MEDICINE GUIDE + CONFIRMATION TAGS)
+      var typingEl = appendAiBubble("bot", "✨ RNS AI Pharmacist जवाब तैयार कर रहा है...");
 
-      // IMPORTANT: NEVER send stock quantity numbers, promo codes, PIN, or other customers' data!
+      // NEVER pass stock piece counts, promo codes, PIN, API key, or customer records!
       var safeStoreCatalog = stockList.map(function(m) {
         var avail = (parseInt(m.stock, 10) || 0) > 0 ? "In Stock" : "Out of Stock";
         return "[ID:" + m.id + "] " + m.name + " | Salt: " + m.generic + " | Co: " + m.company + " | Pack: " + m.pack + " | Category: " + (CATEGORY_LABELS[m.category] || "General") + " | MRP: ₹" + m.mrp + " | Offer: ₹" + m.price + " | Exp: " + m.exp + " | Status: " + avail;
       }).join("\n");
 
       var systemPrompt =
-        "You are the friendly, intelligent, and empathetic AI Pharmacist (powered by Google Gemini) for RNS PHARMACY, Kali Mata Road, Sikta, Padrauna, Kushinagar, UP - 274303. Licensed Pharmacist: Drx. Rahul Singh (B.Pharm). Website: " + RNS_WEB_URL + " | WhatsApp Support: " + RNS_WA_LINK + ".\n" +
+        "You are the friendly, intelligent, and caring AI Pharmacist for RNS PHARMACY (Kali Mata Road, Sikta, Padrauna, Kushinagar, UP - 274303). Licensed Pharmacist: Drx. Rahul Singh (B.Pharm). Website: " + RNS_WEB_URL + " | WhatsApp Support: " + RNS_WA_LINK + ".\n" +
         "Delivery rules: FREE delivery on net medicine orders ₹500+, ₹50 delivery below ₹500, ₹6 packaging charge on every order.\n\n" +
         "STRICT PRIVACY RULES (NEVER VIOLATE):\n" +
-        "- NEVER reveal any promo codes, coupon codes, or secret discounts. If asked, warmly reply: 'प्रोमो कोड केवल योग्य ग्राहकों को सीधे WhatsApp पर भेजे जाते हैं, आप हमारे ऑफर प्राइस पर सीधे ऑर्डर कर सकते हैं।'\n" +
-        "- NEVER reveal exact stock piece counts, Owner PIN, API keys, Appwrite database details, total sales, or any other customer's order/phone.\n\n" +
-        "LANGUAGE & TONE:\n" +
-        "- Reply warmly, politely, and clearly in the EXACT language the user uses (Hindi, Hinglish, English, or simple local Hindi).\n" +
-        "- Answer BOTH medicine/pharmacy questions AND general health/wellness/extra helpful questions with the warmth and intelligence of Gemini.\n\n" +
+        "- NEVER reveal any promo codes, coupon codes, or secret discounts. If asked, reply: 'प्रोमो कोड केवल योग्य ग्राहकों को सीधे WhatsApp पर भेजे जाते हैं, आप हमारे ऑफर प्राइस पर सीधे ऑर्डर कर सकते हैं।'\n" +
+        "- NEVER reveal exact stock piece counts, Owner PIN, API keys, Appwrite details, total sales, or any other customer's order/phone.\n\n" +
+        "LANGUAGE & STYLE:\n" +
+        "- Always respond warmly, politely, and clearly in the EXACT language the user uses (Hindi, Hinglish, English, or simple local Hindi).\n" +
+        "- Answer BOTH medicine/pharmacy queries AND general health, home care, or extra helpful questions smoothly and clearly.\n\n" +
         "A-TO-Z MEDICINE INFORMATION MODE:\n" +
-        "- Whenever the user asks about ANY medicine (uses, side effects, details, or mentions a medicine name), explain it thoroughly A-to-Z in clean readable points:\n" +
+        "- Whenever the user asks about ANY medicine (uses, side effects, details, or names a medicine), provide a complete A-to-Z breakdown in clean, easy-to-read points:\n" +
         "  1) **साल्ट और असर (Composition & Working)**\n" +
         "  2) **मुख्य उपयोग (Uses)**\n" +
         "  3) **लेने का सामान्य तरीका (How to Use)**\n" +
-        "  4) **संभावित साइड इफेक्ट्स (Side Effects)** — common + red-flag warnings\n" +
+        "  4) **संभावित साइड इफेक्ट्स (Side Effects)** — common side effects + serious warning signs\n" +
         "  5) **ज़रूरी सावधानियां (Precautions & Warnings)** — pregnancy, breastfeeding, alcohol, driving, liver/kidney, drug interactions\n" +
-        "  6) **स्टोर उपलब्धता व रेट** (if in store list below, share MRP & Offer Price; never mention piece count)\n" +
-        "  7) End with a short 1-line safety note advising to consult a doctor or Drx. Rahul Singh (B.Pharm) for exact dose.\n\n" +
-        "MISSPELLED / VOICE MEDICINE NAME CORRECTION & CONFIRMATION (CRITICAL):\n" +
-        "- If the user types or speaks a medicine name (even slightly misspelled like 'paracitamol 600', 'moter lc', 'pand d') to order or search, DO NOT directly add it.\n" +
-        "- First correct the spelling/name clearly and politely ask: 'क्या आपका मतलब **[Corrected Name] ([Salt])** से है?'\n" +
-        "- Append EXACTLY ONE confirmation tag at the very end when a medicine can be ordered/added:\n" +
-        "  * If it matches an IN-STOCK item from LIVE STORE CATALOG below: [[CONFIRM_STOCK:EXACT_ID|Corrected Name|Salt]]\n" +
-        "  * If it is a real medicine NOT in LIVE STORE CATALOG (or out of stock): [[CONFIRM_ADDON:Corrected Medicine Name|Salt]]\n" +
-        "- If a same-salt substitute IS in stock, mention it in text too.\n\n" +
+        "  6) **स्टोर उपलब्धता व रेट** (if available in LIVE STORE CATALOG below, mention MRP & Offer Price; NEVER state stock piece count)\n" +
+        "  7) End with a short 1-line safety note: सही डोज़ के लिए अपने डॉक्टर या Drx. Rahul Singh (B.Pharm) से सलाह लें।\n\n" +
+        "MEDICINE NAME CORRECTION & CONFIRMATION (CRITICAL):\n" +
+        "- If the user types or speaks a medicine name (even misspelled like 'paracitamol 600', 'moter lc', 'pand d') to order or search, DO NOT claim it is already added.\n" +
+        "- Politely confirm the corrected name & salt ('क्या आपका मतलब **[Corrected Name] ([Salt])** से है?') and append EXACTLY ONE tag at the very end:\n" +
+        "  * If it matches an IN-STOCK item in LIVE STORE CATALOG below: [[CONFIRM_STOCK:EXACT_ID|Corrected Name|Salt]]\n" +
+        "  * If it is a real medicine NOT in LIVE STORE CATALOG (or Out of Stock): [[CONFIRM_ADDON:Corrected Medicine Name|Salt]]\n" +
+        "- If a same-salt substitute is in stock, mention it in your text too.\n\n" +
         "LIVE STORE CATALOG:\n" + safeStoreCatalog;
 
-      aiGeminiTurns.push({ role: "user", parts: [{ text: rawText }] });
-      if (aiGeminiTurns.length > 14) aiGeminiTurns = aiGeminiTurns.slice(-14);
+      aiChatTurns.push({ role: "user", parts: [{ text: rawText }] });
+      if (aiChatTurns.length > 14) aiChatTurns = aiChatTurns.slice(-14);
 
-      var aiReply = await callGeminiAPI(aiGeminiTurns, systemPrompt, 0.45);
+      var aiReply = await callGroqAI(aiChatTurns, systemPrompt, 0.45);
       if (typingEl && typingEl.parentNode) typingEl.parentNode.removeChild(typingEl);
 
       if (aiReply) {
-        aiGeminiTurns.push({ role: "model", parts: [{ text: aiReply }] });
+        aiChatTurns.push({ role: "assistant", parts: [{ text: aiReply }] });
 
         var confirmHtml = "";
         var cleanText = aiReply
-          .replace(/\[\[CONFIRM_STOCK:\s*([^|\]]+)\|([^|\]]+)\|([^\]]*)\]\]/gi, function(_, id, dName, salt) {
+          .replace(/`?\[\[CONFIRM_STOCK:\s*([^|\]]+)\|([^|\]]+)\|([^\]]*)\]\]`?/gi, function(_, id, dName, salt) {
             confirmHtml += renderAiConfirmCard("STOCK", id.trim(), dName.trim(), salt.trim());
             return "";
           })
-          .replace(/\[\[CONFIRM_ADDON:\s*([^|\]]+)\|([^\]]*)\]\]/gi, function(_, dName, salt) {
+          .replace(/`?\[\[CONFIRM_ADDON:\s*([^|\]]+)\|([^\]]*)\]\]`?/gi, function(_, dName, salt) {
             confirmHtml += renderAiConfirmCard("ADDON", dName.trim(), dName.trim(), salt.trim());
             return "";
           })
-          .replace(/\[\[STOCK:\s*([^\]]+)\]\]/gi, function(_, id) {
+          .replace(/`?\[\[STOCK:\s*([^\]]+)\]\]`?/gi, function(_, id) {
             var med = stockList.find(function(m) { return String(m.id).toLowerCase() === id.trim().toLowerCase(); });
             if (med) confirmHtml += renderAiConfirmCard("STOCK", med.id, med.name, med.generic);
             return "";
           })
-          .replace(/\[\[ADDON:\s*([^\]]+)\]\]/gi, function(_, dName) {
+          .replace(/`?\[\[ADDON:\s*([^\]]+)\]\]`?/gi, function(_, dName) {
             var det = detectIndianMedicine(dName);
             confirmHtml += renderAiConfirmCard("ADDON", dName.trim(), det ? det.brand : dName.trim(), det ? det.salt : "");
             return "";
           })
           .trim();
 
-        appendAiBubble("bot", formatGeminiMarkdownToHtml(cleanText) + confirmHtml);
+        appendAiBubble("bot", formatAiMarkdownToHtml(cleanText) + confirmHtml);
         return;
       }
 
-      // Offline / Fallback Smart Handler if network is completely down
-      aiGeminiTurns.pop();
+      // Offline / Fallback Smart Handler
+      aiChatTurns.pop();
       var stockHits = findStockMatches(rawText);
       var knownMed = detectIndianMedicine(rawText);
       if (stockHits.length > 0) {
@@ -5086,7 +5168,7 @@
         );
       } else {
         appendAiBubble("bot",
-          'अभी इंटरनेट या AI सर्वर थोड़ा धीमा है। कृपया 2 सेकंड बाद दोबारा पूछें, या सीधे हमारे व्हाट्सएप पर बात करें:<div class="ai-quick-chips"><a class="ai-chip" style="text-decoration:none;" href="' + RNS_WA_LINK + '" target="_blank">💬 WhatsApp Support</a></div>'
+          'अभी AI से संपर्क नहीं हो पा रहा है। कृपया थोड़ी देर बाद दोबारा पूछें या सीधे WhatsApp पर जुड़ें:<div class="ai-quick-chips"><a class="ai-chip" style="text-decoration:none;" href="' + RNS_WA_LINK + '" target="_blank">💬 WhatsApp Support</a></div>'
         );
       }
     }
@@ -5296,6 +5378,12 @@
         if (tb) tb.textContent = "☀️";
       }
 
+      var keyInp = document.getElementById("ownerGeminiKey");
+      if (keyInp) {
+        keyInp.placeholder = "Paste Groq API Key (gsk_...)";
+        keyInp.value = getActiveAIKey();
+      }
+
       var msgBox = document.getElementById("promoBroadcastMsgBox");
       if (msgBox) {
         msgBox.addEventListener("input", function() {
@@ -5306,7 +5394,10 @@
       renderCatalog();
       renderReviews();
       updateCartUI();
-      syncFromCloud();
+      syncFromCloud().then(function() {
+        var ki = document.getElementById("ownerGeminiKey");
+        if (ki && !ki.value) ki.value = getActiveAIKey();
+      });
       startAppwriteRealtime();
     });
   </script>
