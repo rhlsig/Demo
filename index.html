@@ -5745,6 +5745,400 @@
       };
     })();
   </script>
+    <!-- ===== GEMINI VISION 3-PHOTO SCANNER + GROQ HYBRID AI ENGINE ===== -->
+  <script>
+    (function() {
+      var VISION_STORAGE_KEY = "rns_owner_gemini_vision_key_v5";
+      window.RNS_CLOUD_VISION_KEY = window.RNS_CLOUD_VISION_KEY || "";
+      var geminiModelsCache = null;
+
+      function normalizeVisionKey(k) {
+        return String(k || "").replace(/\s+/g, "");
+      }
+
+      function getActiveVisionKey() {
+        var localK = normalizeVisionKey(localStorage.getItem(VISION_STORAGE_KEY));
+        if (localK && localK.indexOf("AIza") === 0) return localK;
+        var cloudK = normalizeVisionKey(window.RNS_CLOUD_VISION_KEY);
+        if (cloudK && cloudK.indexOf("AIza") === 0) return cloudK;
+        return "";
+      }
+
+      /* 1. Sync Gemini Vision Key automatically from Appwrite Cloud */
+      var _origAwListRows = awListAllRows;
+      awListAllRows = async function() {
+        var rows = await _origAwListRows();
+        if (Array.isArray(rows)) {
+          rows.forEach(function(row) {
+            if (row && row.type === "gemini_vision_cfg") {
+              var cfg = safeJsonParse(row.data, null);
+              if (cfg && cfg.k) {
+                window.RNS_CLOUD_VISION_KEY = normalizeVisionKey(cfg.k);
+                var inp = document.getElementById("ownerVisionKey");
+                if (inp && !inp.value) inp.value = window.RNS_CLOUD_VISION_KEY;
+              }
+            }
+          });
+        }
+        return rows;
+      };
+
+      /* 2. Inject Gemini Vision Key Bar cleanly inside Scanner Card */
+      function injectVisionKeyUI() {
+        if (document.getElementById("ownerVisionKey")) return;
+        var groqInp = document.getElementById("ownerGeminiKey");
+        if (!groqInp) return;
+        var card = groqInp.closest(".ai-scanner-card");
+        if (!card) return;
+
+        var bar = document.createElement("div");
+        bar.style.cssText = "display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; padding:9px 11px; margin-bottom:10px; border-radius:11px; background:var(--card); border:1px dashed rgba(2,132,199,0.5);";
+        bar.innerHTML =
+          '<div style="font-size:12px; font-weight:700; color:#0284c7;">📸 Gemini Vision Key <span style="font-weight:500; color:var(--muted);">(3-Photo सटीक स्कैनिंग हेतु)</span>:</div>' +
+          '<div style="display:flex; flex-wrap:wrap; gap:6px; align-items:center;">' +
+            '<input type="password" id="ownerVisionKey" class="input-field" style="width:200px; padding:6px 10px; font-size:12px;" placeholder="Paste Gemini Key (AIza...)" />' +
+            '<button type="button" class="btn-primary" style="padding:6px 11px; font-size:11.5px; background:linear-gradient(135deg,#0284c7,#0369a1);" onclick="saveVisionApiKey()">🔑 Save Vision Key</button>' +
+            '<button type="button" class="btn-outline" style="padding:6px 10px; font-size:11.5px; border-color:#0284c7; color:#0284c7;" onclick="testVisionKeyNow()">🧪 Test Vision</button>' +
+          '</div>';
+
+        var firstRow = card.firstElementChild;
+        if (firstRow) firstRow.insertAdjacentElement("afterend", bar);
+        else card.prepend(bar);
+
+        var vInp = document.getElementById("ownerVisionKey");
+        if (vInp) vInp.value = getActiveVisionKey();
+      }
+
+      window.saveVisionApiKey = async function() {
+        var inp = document.getElementById("ownerVisionKey");
+        var val = normalizeVisionKey(inp ? inp.value : "");
+        if (inp) inp.value = val;
+
+        if (!val) {
+          localStorage.removeItem(VISION_STORAGE_KEY);
+          window.RNS_CLOUD_VISION_KEY = "";
+          geminiModelsCache = null;
+          await awDeleteRow("cfg_vision").catch(function() {});
+          return showToast("🔑 Gemini Vision Key हटा दी गई।", "warn");
+        }
+
+        if (val.indexOf("AIza") !== 0) {
+          return showToast("⚠️ कृपया सही Google Gemini Key डालें (जो AIza से शुरू होती है)।", "error");
+        }
+
+        localStorage.setItem(VISION_STORAGE_KEY, val);
+        window.RNS_CLOUD_VISION_KEY = val;
+        geminiModelsCache = null;
+
+        try {
+          await awUpsertRow("cfg_vision", "gemini_vision_cfg", { k: val, provider: "gemini", updatedAt: Date.now() });
+          showToast("✅ Gemini Vision Key Appwrite Cloud पर सेव हो गई! अब 3-Photo Scanner पूरी सटीकता से चलेगा।");
+        } catch (e) {
+          showToast("🔑 Vision Key लोकल में सेव हो गई (इंटरनेट जांचें)।", "warn");
+        }
+      };
+
+      /* 3. Auto-discover Live Gemini Models (Prevents "model not found" errors forever) */
+      async function discoverGeminiModels(apiKey) {
+        if (Array.isArray(geminiModelsCache) && geminiModelsCache.length > 0) {
+          return geminiModelsCache;
+        }
+        var preferred = [
+          "gemini-2.5-flash",
+          "gemini-2.5-flash-lite",
+          "gemini-2.0-flash",
+          "gemini-2.0-flash-lite",
+          "gemini-1.5-flash"
+        ];
+        try {
+          var r = await fetchWithTimeout(
+            "https://generativelanguage.googleapis.com/v1beta/models?key=" + encodeURIComponent(apiKey),
+            { method: "GET" },
+            10000
+          );
+          if (r.ok) {
+            var j = await r.json();
+            if (j && Array.isArray(j.models)) {
+              var available = j.models
+                .filter(function(m) {
+                  var methods = m.supportedGenerationMethods || [];
+                  var name = String(m.name || "").replace(/^models\//, "");
+                  return methods.indexOf("generateContent") !== -1 &&
+                    /^gemini-/i.test(name) &&
+                    !/embedding|imagen|veo|tts|audio|live|aqa|robotics|computer-use|image-generation/i.test(name);
+                })
+                .map(function(m) { return String(m.name || "").replace(/^models\//, ""); });
+
+              var ordered = [];
+              preferred.forEach(function(p) {
+                if (available.indexOf(p) !== -1) ordered.push(p);
+              });
+              available.forEach(function(id) {
+                if (ordered.indexOf(id) === -1 && /flash/i.test(id)) ordered.push(id);
+              });
+              available.forEach(function(id) {
+                if (ordered.indexOf(id) === -1) ordered.push(id);
+              });
+
+              if (ordered.length > 0) {
+                geminiModelsCache = ordered.slice(0, 6);
+                return geminiModelsCache;
+              }
+            }
+          }
+        } catch (e) {}
+        return preferred;
+      }
+
+      async function callGeminiVisionAPI(contents, systemInstruction, tempVal) {
+        var apiKey = getActiveVisionKey();
+        if (!apiKey) {
+          await syncFromCloud().catch(function() {});
+          apiKey = getActiveVisionKey();
+        }
+        if (!apiKey) {
+          lastAiErr = "Gemini Vision Key सेट नहीं है—कृपया ऊपर AIza... Key डालकर 'Save Vision Key' दबाएं।";
+          return null;
+        }
+
+        var models = await discoverGeminiModels(apiKey);
+        var errLog = [];
+
+        for (var i = 0; i < models.length; i++) {
+          var mName = models[i];
+          try {
+            var payload = {
+              contents: contents,
+              generationConfig: {
+                temperature: (typeof tempVal === "number") ? tempVal : 0.1,
+                maxOutputTokens: 1500
+              }
+            };
+            if (systemInstruction) {
+              payload.systemInstruction = { parts: [{ text: systemInstruction }] };
+            }
+
+            var url = "https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(mName) + ":generateContent?key=" + encodeURIComponent(apiKey);
+            var res = await fetchWithTimeout(url, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payload)
+            }, 30000);
+
+            var json = await res.json().catch(function() { return {}; });
+            if (res.ok) {
+              var cand = json.candidates && json.candidates[0];
+              var parts = cand && cand.content && cand.content.parts ? cand.content.parts : [];
+              var txt = parts.map(function(p) { return p.text || ""; }).join("").trim();
+              if (txt) {
+                lastAiModelUsed = "Gemini (" + mName + ")";
+                return txt;
+              }
+            } else {
+              var eMsg = (json && json.error && json.error.message) ? json.error.message : ("HTTP " + res.status);
+              errLog.push(mName + ": " + eMsg);
+              if (/API_KEY_INVALID|API key not valid|leaked|suspended/i.test(eMsg)) break;
+              if (res.status === 429 || res.status === 503) {
+                await new Promise(function(r) { setTimeout(r, 500); });
+              }
+            }
+          } catch (e) {
+            errLog.push(mName + ": " + (e.message || "Network Error"));
+          }
+        }
+
+        lastAiErr = errLog[0] || "Gemini Vision से संपर्क नहीं हो पाया।";
+        return null;
+      }
+
+      window.testVisionKeyNow = async function() {
+        var logEl = document.getElementById("ownerAiStatusLog");
+        geminiModelsCache = null;
+        if (logEl) logEl.textContent = "🧪 Google Gemini Vision Key टेस्ट हो रही है...";
+        var out = await callGeminiVisionAPI([{ role: "user", parts: [{ text: "Reply with just: OK" }] }], "", 0.1);
+        if (out) {
+          var okMsg = "✅ बधाई हो! Google Gemini Vision 100% चालू है — " + lastAiModelUsed + " (अब रंगीन डिब्बे व लोगो भी एकदम सटीक पढ़ेगा!)";
+          if (logEl) logEl.textContent = okMsg;
+          showToast(okMsg);
+        } else {
+          var failMsg = "❌ Gemini Vision Error: " + (lastAiErr || "Unknown Error");
+          if (logEl) logEl.textContent = failMsg;
+          showToast(failMsg, "error");
+        }
+      };
+
+      /* 4. Groq Primary Text AI + Automatic Gemini Backup for Customer AI */
+      function getLiveGroqTextModels(liveList) {
+        var list = Array.isArray(liveList) ? liveList : [];
+        var pref = ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "qwen/qwen3-32b", "llama-3.1-8b-instant"];
+        var out = [];
+        pref.forEach(function(m) { if (list.length === 0 || list.indexOf(m) !== -1) out.push(m); });
+        list.forEach(function(id) {
+          if (out.indexOf(id) !== -1) return;
+          if (/whisper|tts|guard|safeguard|prompt-guard|orpheus|playai|compound-beta/i.test(id)) return;
+          out.push(id);
+        });
+        return out.length > 0 ? out : ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"];
+      }
+
+      callGroqAI = async function(turnsOrParts, systemInstruction, tempVal) {
+        var isMultiTurn = Array.isArray(turnsOrParts) && turnsOrParts.length > 0 && turnsOrParts[0].role;
+        var turns = isMultiTurn ? turnsOrParts : [{ role: "user", parts: turnsOrParts }];
+        var groqKey = getActiveAIKey();
+        if (!groqKey) {
+          await syncFromCloud().catch(function() {});
+          groqKey = getActiveAIKey();
+        }
+
+        var messages = [];
+        if (systemInstruction) messages.push({ role: "system", content: systemInstruction });
+        turns.forEach(function(t) {
+          var role = (t.role === "model" || t.role === "assistant") ? "assistant" : "user";
+          var parts = Array.isArray(t.parts) ? t.parts : [];
+          var txt = parts.map(function(p) { return (p && p.text) ? p.text : ""; }).join("\n").trim();
+          if (txt) messages.push({ role: role, content: txt });
+        });
+
+        // Try Groq first (Super Fast)
+        if (groqKey) {
+          var liveList = await discoverGroqModels(groqKey);
+          var models = getLiveGroqTextModels(liveList);
+          for (var i = 0; i < models.length; i++) {
+            try {
+              var res = await fetchWithTimeout("https://api.groq.com/openai/v1/chat/completions", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "Authorization": "Bearer " + groqKey },
+                body: JSON.stringify({
+                  model: models[i],
+                  messages: messages,
+                  temperature: (typeof tempVal === "number") ? tempVal : 0.45,
+                  max_tokens: 1500
+                })
+              }, 24000);
+              var json = await res.json().catch(function() { return {}; });
+              if (res.ok) {
+                var txt = json.choices && json.choices[0] && json.choices[0].message && json.choices[0].message.content
+                  ? String(json.choices[0].message.content).replace(/<think>[\s\S]*?<\/think>/gi, "").trim()
+                  : "";
+                if (txt) {
+                  lastAiModelUsed = models[i];
+                  return txt;
+                }
+              } else {
+                lastAiErr = (json && json.error && json.error.message) ? json.error.message : ("HTTP " + res.status);
+                if (res.status === 401 || res.status === 403) break;
+              }
+            } catch (e) {
+              lastAiErr = e.message || "Network Error";
+            }
+          }
+        }
+
+        // Automatic fallback to Gemini if Groq is busy
+        if (getActiveVisionKey()) {
+          var gContents = turns.map(function(t) {
+            return {
+              role: (t.role === "model" || t.role === "assistant") ? "model" : "user",
+              parts: (Array.isArray(t.parts) ? t.parts : []).filter(function(p) { return p && p.text; }).map(function(p) { return { text: p.text }; })
+            };
+          }).filter(function(c) { return c.parts.length > 0; });
+          if (gContents.length > 0) {
+            return await callGeminiVisionAPI(gContents, systemInstruction, tempVal);
+          }
+        }
+        return null;
+      };
+
+      /* 5. HIGH-ACCURACY 3-PHOTO SCANNER USING GOOGLE GEMINI VISION */
+      scanMedicinePhotosWithAI = async function() {
+        var fFront = document.getElementById("aiMedFrontImg") && document.getElementById("aiMedFrontImg").files[0];
+        var fBack  = document.getElementById("aiMedBackImg") && document.getElementById("aiMedBackImg").files[0];
+        var fSide  = document.getElementById("aiMedSideImg") && document.getElementById("aiMedSideImg").files[0];
+        var logEl  = document.getElementById("ownerAiStatusLog");
+        var btn    = document.getElementById("btnScanMedAi");
+
+        var labeledFiles = [
+          { label: "FRONT PHOTO", file: fFront },
+          { label: "BACK PHOTO", file: fBack },
+          { label: "SIDE / FLAP PHOTO", file: fSide }
+        ].filter(function(x) { return !!x.file; });
+
+        if (labeledFiles.length === 0) {
+          return showToast("कृपया दवा की कम से कम एक फोटो (Front, Back या Side) चुनें।", "warn");
+        }
+
+        if (!getActiveVisionKey()) {
+          return showToast("🔑 कृपया ऊपर नीली पट्टी में अपनी Gemini Vision Key (AIza...) डालकर 'Save Vision Key' दबाएं।", "warn");
+        }
+
+        btn.disabled = true;
+        btn.textContent = "⏳ Gemini Vision फोटो पढ़ रहा है...";
+        logEl.textContent = "👁️ Google Gemini Vision तीनों फोटो को सीधे देखकर ब्रांड नाम, कंपनी लोगो, पैक, साल्ट, बैच, एक्सपायरी व MRP पढ़ रहा है...";
+
+        try {
+          var parts = [{
+            text:
+              "You are an expert Indian Pharmacy Inventory OCR & Vision specialist. Carefully inspect ALL attached photos of this Indian medicine box/strip/bottle (Front, Back, and/or Side/Flap). " +
+              "Read EVERY detail accurately directly from the images, including stylized/colored Brand Names (e.g. 'Ascodex LS Junior', 'Dolo 650', 'Pan-D'), company logos (e.g. 'Glenmark Pharmaceuticals', 'Cipla', 'Micro Labs', 'Alkem'), exact pack/volume size (e.g. '60 ml Bottle', '100 ml Syrup', 'Strip of 15 Tablets'), complete generic salt composition with strengths, Batch No., Expiry Date (MM/YYYY), and numeric MRP in INR. " +
+              "Never guess or invent a brand name—read the exact printed Brand Name carefully. " +
+              "Return ONLY valid raw JSON (no markdown fences, no extra text) with these exact keys: " +
+              "{\"name\":\"\",\"generic\":\"\",\"category\":\"\",\"company\":\"\",\"pack\":\"\",\"batch\":\"\",\"exp\":\"\",\"mrp\":0,\"summary\":\"\"}. " +
+              "For 'category', pick EXACTLY ONE key from: FEVER_PAIN, COUGH_COLD, GASTRIC, VITAMINS, ANTIBIOTICS, SUGAR_BP, SYRUP, DROPS_GELS, OTHER. " +
+              "For 'summary', write 1 short Hindi sentence confirming the exact brand name, company, pack, batch, expiry & MRP read."
+          }];
+
+          for (var i = 0; i < labeledFiles.length; i++) {
+            var comp = await compressImageToBlobAndDataUrl(labeledFiles[i].file, 1200, 0.85);
+            parts.push({ text: labeledFiles[i].label + ":" });
+            parts.push({
+              inlineData: {
+                mimeType: "image/jpeg",
+                data: comp.dataUrl.split(",")[1]
+              }
+            });
+          }
+
+          var vResp = await callGeminiVisionAPI(
+            [{ role: "user", parts: parts }],
+            "Extract 100% accurate Indian pharmacy packaging details and return ONLY raw JSON.",
+            0.1
+          );
+
+          if (!vResp) throw new Error(lastAiErr || "Gemini Vision से जवाब नहीं मिला—कृपया Key और इंटरनेट जांचें।");
+
+          var vm = vResp.match(/\{[\s\S]*\}/);
+          var parsed = vm ? safeJsonParse(vm[0], null) : null;
+          if (!parsed) throw new Error("फोटो का डेटा स्पष्ट नहीं मिला—कृपया एक बार फिर स्कैन करें।");
+
+          fillInventoryFormFromObj(parsed);
+          logEl.textContent = "✅ [" + lastAiModelUsed + "] " + (parsed.summary || "सारी डिटेल सटीक भर दी गई!") + " कृपया चेक करके '💾 Save & Cloud Sync' दबाएं।";
+          showToast("✨ " + lastAiModelUsed + " से 3-Photo स्कैन 100% सफल!");
+          var nameField = document.getElementById("medName");
+          if (nameField) nameField.focus();
+        } catch (err) {
+          logEl.textContent = "⚠️ " + (err.message || "Scan failed");
+          showToast("⚠️ " + (err.message || "Scan failed"), "error");
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "✨ AI Scan 3 Photos & Auto-Fill Form";
+        }
+      };
+
+      function bootVisionUI() {
+        injectVisionKeyUI();
+        setTimeout(function() {
+          var vInp = document.getElementById("ownerVisionKey");
+          if (vInp && !vInp.value) vInp.value = getActiveVisionKey();
+        }, 1200);
+      }
+
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", bootVisionUI);
+      } else {
+        bootVisionUI();
+      }
+    })();
+  </script>
 </body>
 </html>
 <!-- ===== PART 4 END ===== -->
