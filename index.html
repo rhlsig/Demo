@@ -5401,6 +5401,350 @@
       startAppwriteRealtime();
     });
   </script>
+    <!-- ===== PERMANENT HYBRID AI & 3-PHOTO OCR FIX ===== -->
+  <script>
+    (function() {
+      function loadTesseractEngine() {
+        return new Promise(function(resolve, reject) {
+          if (window.Tesseract) return resolve(window.Tesseract);
+          var s = document.createElement("script");
+          s.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+          s.onload = function() {
+            if (window.Tesseract) resolve(window.Tesseract);
+            else reject(new Error("OCR इंजन लोड नहीं हो पाया।"));
+          };
+          s.onerror = function() { reject(new Error("इंटरनेट से OCR इंजन डाउनलोड नहीं हो पाया।")); };
+          document.head.appendChild(s);
+        });
+      }
+
+      function preprocessImageForOcr(file) {
+        return new Promise(function(resolve) {
+          var reader = new FileReader();
+          reader.onload = function(evt) {
+            var img = new Image();
+            img.onload = function() {
+              var maxDim = 1400;
+              var w = img.width, h = img.height;
+              if (w > maxDim || h > maxDim) {
+                if (w > h) { h = Math.round((h * maxDim) / w); w = maxDim; }
+                else { w = Math.round((w * maxDim) / h); h = maxDim; }
+              }
+              var canvas = document.createElement("canvas");
+              canvas.width = w;
+              canvas.height = h;
+              var ctx = canvas.getContext("2d");
+              ctx.drawImage(img, 0, 0, w, h);
+
+              // Grayscale + mild contrast boost for crisp medicine strip OCR
+              try {
+                var imgData = ctx.getImageData(0, 0, w, h);
+                var d = imgData.data;
+                var contrast = 1.28;
+                var intercept = 128 * (1 - contrast);
+                for (var i = 0; i < d.length; i += 4) {
+                  var gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+                  var val = Math.max(0, Math.min(255, gray * contrast + intercept));
+                  d[i] = d[i + 1] = d[i + 2] = val;
+                }
+                ctx.putImageData(imgData, 0, 0);
+              } catch (e) {}
+
+              resolve(canvas.toDataURL("image/jpeg", 0.88));
+            };
+            img.onerror = function() { resolve(evt.target.result); };
+            img.src = evt.target.result;
+          };
+          reader.readAsDataURL(file);
+        });
+      }
+
+      function getLiveModelsByType(liveList, wantVision) {
+        var list = Array.isArray(liveList) ? liveList : [];
+        if (wantVision) {
+          return list.filter(function(id) {
+            return /vision|llama-4|scout|maverick|pixtral|llava|vl|multimodal/i.test(id) &&
+              !/guard|safeguard|whisper|tts|audio/i.test(id);
+          });
+        }
+
+        var preferredOrder = [
+          "llama-3.3-70b-versatile",
+          "openai/gpt-oss-120b",
+          "qwen/qwen3-32b",
+          "llama-3.1-8b-instant",
+          "openai/gpt-oss-20b"
+        ];
+        var chosen = [];
+        preferredOrder.forEach(function(m) {
+          if (list.length === 0 || list.indexOf(m) !== -1) chosen.push(m);
+        });
+        list.forEach(function(id) {
+          if (chosen.indexOf(id) !== -1) return;
+          if (/whisper|tts|guard|safeguard|prompt-guard|orpheus|playai|compound-beta/i.test(id)) return;
+          chosen.push(id);
+        });
+        return chosen.length > 0 ? chosen : ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"];
+      }
+
+      // Override callGroqAI to ONLY call models that actually exist on this Groq account
+      callGroqAI = async function(turnsOrParts, systemInstruction, tempVal) {
+        var isMultiTurn = Array.isArray(turnsOrParts) && turnsOrParts.length > 0 && turnsOrParts[0].role;
+        var turns = isMultiTurn ? turnsOrParts : [{ role: "user", parts: turnsOrParts }];
+        var apiKey = getActiveAIKey();
+
+        if (!apiKey) {
+          await syncFromCloud().catch(function() {});
+          apiKey = getActiveAIKey();
+        }
+        if (!apiKey) {
+          lastAiErr = "Groq Key सेट नहीं है—कृपया Owner Portal में gsk_ Key डालकर Save Key दबाएं।";
+          return null;
+        }
+
+        var hasImages = turns.some(function(t) {
+          return Array.isArray(t.parts) && t.parts.some(function(p) { return p && p.inlineData && p.inlineData.data; });
+        });
+
+        var liveList = await discoverGroqModels(apiKey);
+        var candidateModels = getLiveModelsByType(liveList, hasImages);
+
+        if (hasImages && candidateModels.length === 0) {
+          lastAiErr = "NO_GROQ_VISION_MODEL";
+          return null;
+        }
+
+        var messages = [];
+        if (systemInstruction && !hasImages) {
+          messages.push({ role: "system", content: systemInstruction });
+        }
+
+        turns.forEach(function(t, idx) {
+          var role = (t.role === "model" || t.role === "assistant") ? "assistant" : "user";
+          var parts = Array.isArray(t.parts) ? t.parts : [];
+          if (hasImages) {
+            var contentArr = [];
+            if (idx === 0 && systemInstruction) contentArr.push({ type: "text", text: systemInstruction + "\n\n" });
+            parts.forEach(function(p) {
+              if (p && p.text) contentArr.push({ type: "text", text: p.text });
+              else if (p && p.inlineData && p.inlineData.data) {
+                contentArr.push({
+                  type: "image_url",
+                  image_url: { url: "data:" + (p.inlineData.mimeType || "image/jpeg") + ";base64," + p.inlineData.data }
+                });
+              }
+            });
+            if (contentArr.length > 0) messages.push({ role: role, content: contentArr });
+          } else {
+            var joinedText = parts.map(function(p) { return (p && p.text) ? p.text : ""; }).join("\n").trim();
+            if (joinedText) messages.push({ role: role, content: joinedText });
+          }
+        });
+
+        lastAiErr = "";
+        lastAiModelUsed = "";
+        var errLog = [];
+
+        for (var i = 0; i < candidateModels.length; i++) {
+          var modelName = candidateModels[i];
+          try {
+            var res = await fetchWithTimeout("https://api.groq.com/openai/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + apiKey
+              },
+              body: JSON.stringify({
+                model: modelName,
+                messages: messages,
+                temperature: (typeof tempVal === "number") ? tempVal : 0.45,
+                max_tokens: 1500
+              })
+            }, 26000);
+
+            var json = await res.json().catch(function() { return {}; });
+            if (res.ok) {
+              var txt = json.choices && json.choices[0] && json.choices[0].message && json.choices[0].message.content
+                ? String(json.choices[0].message.content).replace(/<think>[\s\S]*?<\/think>/gi, "").trim()
+                : "";
+              if (txt) {
+                lastAiModelUsed = modelName;
+                return txt;
+              }
+            } else {
+              var eMsg = (json && json.error && json.error.message) ? json.error.message : ("HTTP " + res.status);
+              errLog.push(modelName + ": " + eMsg);
+              if (res.status === 401 || res.status === 403) break;
+              if (res.status === 429 || res.status === 503) {
+                await new Promise(function(r) { setTimeout(r, 400); });
+              }
+            }
+          } catch (e) {
+            errLog.push(modelName + ": " + (e.message || "Network Error"));
+          }
+        }
+
+        lastAiErr = errLog[0] || "Groq AI से संपर्क नहीं हो पाया।";
+        return null;
+      };
+
+      // Upgraded 3-Photo Scanner: Tries Live Groq Vision first -> Auto-switches to Browser OCR + Groq Text AI
+      scanMedicinePhotosWithAI = async function() {
+        var fFront = document.getElementById("aiMedFrontImg") && document.getElementById("aiMedFrontImg").files[0];
+        var fBack  = document.getElementById("aiMedBackImg") && document.getElementById("aiMedBackImg").files[0];
+        var fSide  = document.getElementById("aiMedSideImg") && document.getElementById("aiMedSideImg").files[0];
+        var logEl  = document.getElementById("ownerAiStatusLog");
+        var btn    = document.getElementById("btnScanMedAi");
+
+        var labeledFiles = [
+          { label: "FRONT PHOTO", file: fFront },
+          { label: "BACK PHOTO", file: fBack },
+          { label: "SIDE / FLAP PHOTO", file: fSide }
+        ].filter(function(x) { return !!x.file; });
+
+        if (labeledFiles.length === 0) {
+          return showToast("कृपया दवा की कम से कम एक फोटो (Front, Back या Side) चुनें।", "warn");
+        }
+
+        var apiKey = getActiveAIKey();
+        if (!apiKey) {
+          return showToast("🔑 पहले ऊपर अपनी Groq Key (gsk_...) पेस्ट करके 'Save Key' दबाएं।", "warn");
+        }
+
+        btn.disabled = true;
+        btn.textContent = "⏳ AI फोटो स्कैन कर रहा है...";
+        logEl.textContent = "🤖 स्कैनर तैयार हो रहा है...";
+
+        try {
+          var parsed = null;
+          var usedMode = "";
+
+          // STAGE 1: Check if a live Groq Vision model exists on this account
+          var liveList = await discoverGroqModels(apiKey);
+          var visionModels = getLiveModelsByType(liveList, true);
+
+          if (visionModels.length > 0) {
+            logEl.textContent = "⚡ Groq Vision (" + visionModels[0] + ") से " + labeledFiles.length + " फोटो पढ़ी जा रही हैं...";
+            var vParts = [{
+              text:
+                "You are an expert Indian Pharmacy Inventory OCR specialist. Inspect ALL attached photos of this medicine and return ONLY valid raw JSON (no markdown) with exact keys: " +
+                "{\"name\":\"\",\"generic\":\"\",\"category\":\"\",\"company\":\"\",\"pack\":\"\",\"batch\":\"\",\"exp\":\"\",\"mrp\":0,\"summary\":\"\"}. " +
+                "Category MUST be one of: FEVER_PAIN, COUGH_COLD, GASTRIC, VITAMINS, ANTIBIOTICS, SUGAR_BP, SYRUP, DROPS_GELS, OTHER. " +
+                "summary = 1 short Hindi line stating what was read."
+            }];
+            for (var v = 0; v < labeledFiles.length; v++) {
+              var comp = await compressImageToBlobAndDataUrl(labeledFiles[v].file, 960, 0.72);
+              vParts.push({ text: labeledFiles[v].label + ":" });
+              vParts.push({ inlineData: { mimeType: "image/jpeg", data: comp.dataUrl.split(",")[1] } });
+            }
+            var vResp = await callGroqAI(vParts, "Output ONLY raw JSON.", 0.1);
+            if (vResp) {
+              var vm = vResp.match(/\{[\s\S]*\}/);
+              if (vm) {
+                parsed = safeJsonParse(vm[0], null);
+                usedMode = "Groq Vision";
+              }
+            }
+          }
+
+          // STAGE 2: Automatic Free Browser OCR (Tesseract.js) + Groq Text AI (Always Works!)
+          if (!parsed) {
+            logEl.textContent = "🔍 Smart Hybrid OCR इंजन लोड हो रहा है (पहली बार 3-5 सेकंड लगते हैं)...";
+            var TesseractLib = await loadTesseractEngine();
+            var extractedBlocks = [];
+            var worker = null;
+
+            try {
+              worker = await TesseractLib.createWorker("eng", 1, {
+                logger: function(m) {
+                  if (m && m.status === "recognizing text" && typeof m.progress === "number") {
+                    var pct = Math.round(m.progress * 100);
+                    logEl.textContent = "🔍 फोटो के अक्षर पढ़े जा रहे हैं (" + pct + "%)...";
+                  }
+                }
+              });
+
+              for (var k = 0; k < labeledFiles.length; k++) {
+                logEl.textContent = "📸 फोटो " + (k + 1) + "/" + labeledFiles.length + " (" + labeledFiles[k].label + ") स्कैन हो रही है...";
+                var ocrImg = await preprocessImageForOcr(labeledFiles[k].file);
+                var ocrOut = await worker.recognize(ocrImg);
+                var cleanTxt = (ocrOut && ocrOut.data && ocrOut.data.text) ? ocrOut.data.text.trim() : "";
+                if (cleanTxt) {
+                  extractedBlocks.push("=== " + labeledFiles[k].label + " ===\n" + cleanTxt);
+                }
+              }
+            } finally {
+              if (worker) await worker.terminate().catch(function() {});
+            }
+
+            var combinedOcrText = extractedBlocks.join("\n\n").trim();
+            if (combinedOcrText.length < 4) {
+              throw new Error("फोटो से अक्षर स्पष्ट नहीं पढ़े जा सके—कृपया तेज़ रोशनी में पास से फोटो लें या नीचे 'AI Parse Text' में दवा का नाम लिखें।");
+            }
+
+            logEl.textContent = "🧠 Groq AI (" + labeledFiles.length + " फोटो का टेक्स्ट) समझकर फॉर्म और कैटेगरी भर रहा है...";
+            var ocrPrompt =
+              "You are an expert Indian Pharmacy Inventory specialist. Below is raw OCR text read from Front, Back, and/or Side photos of an Indian medicine strip/box. " +
+              "OCR may have minor spelling glitches—intelligently reconstruct accurate Indian medicine details and return ONLY valid raw JSON (no markdown, no explanation) with exact keys: " +
+              "{\"name\":\"\",\"generic\":\"\",\"category\":\"\",\"company\":\"\",\"pack\":\"\",\"batch\":\"\",\"exp\":\"\",\"mrp\":0,\"summary\":\"\"}.\n" +
+              "Rules:\n" +
+              "- name: Exact Indian Brand/Product Name with strength (e.g. Dolo 650, Pan-D, Amoxyclav 625)\n" +
+              "- generic: Exact Salt / Composition (infer standard salt if famous Indian brand is clearly identified)\n" +
+              "- category: Choose EXACTLY ONE from: FEVER_PAIN, COUGH_COLD, GASTRIC, VITAMINS, ANTIBIOTICS, SUGAR_BP, SYRUP, DROPS_GELS, OTHER\n" +
+              "- company: Marketed By / Manufactured By company\n" +
+              "- pack: Packing size (e.g. Strip of 15 Tablets, 100ml Bottle)\n" +
+              "- batch: Batch No. if visible in text (else leave empty string)\n" +
+              "- exp: Expiry Date in MM/YYYY if visible (else leave empty string)\n" +
+              "- mrp: Numeric MRP in INR (e.g. 35 or 155, 0 if not visible)\n" +
+              "- summary: 1 short Hindi line stating what was extracted.\n\n" +
+              "RAW OCR TEXT:\n" + combinedOcrText;
+
+            var textResp = await callGroqAI([{ text: ocrPrompt }], "Return ONLY valid raw JSON.", 0.15);
+            if (!textResp) throw new Error(lastAiErr || "Groq AI से जवाब नहीं मिला।");
+
+            var tm = textResp.match(/\{[\s\S]*\}/);
+            parsed = tm ? safeJsonParse(tm[0], null) : null;
+            if (!parsed) throw new Error("AI से डेटा फॉर्मेट सही नहीं मिला—कृपया दोबारा प्रयास करें।");
+            usedMode = "Hybrid OCR + Groq AI (" + lastAiModelUsed + ")";
+          }
+
+          fillInventoryFormFromObj(parsed);
+          logEl.textContent = "✅ [" + usedMode + "] " + (parsed.summary || "सारी डिटेल व कैटेगरी ऑटो-फिल हो गई!") + " कृपया एक बार चेक करके '💾 Save & Cloud Sync' दबाएं।";
+          showToast("✨ स्कैन सफल! फॉर्म और कैटेगरी ऑटो-फिल हो गए।");
+          var nameField = document.getElementById("medName");
+          if (nameField) nameField.focus();
+        } catch (err) {
+          logEl.textContent = "⚠️ " + (err.message || "Scan failed");
+          showToast("⚠️ " + (err.message || "Scan failed"), "error");
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "✨ AI Scan 3 Photos & Auto-Fill Form";
+        }
+      };
+
+      // Clear diagnostic Test Key button
+      testGeminiKeyNow = async function() {
+        var logEl = document.getElementById("ownerAiStatusLog");
+        groqLiveModelsCache = null;
+        if (logEl) logEl.textContent = "🧪 Groq AI और Scanner मोड चेक हो रहा है...";
+        var apiKey = getActiveAIKey();
+        var liveList = apiKey ? await discoverGroqModels(apiKey) : [];
+        var visModels = getLiveModelsByType(liveList, true);
+        var out = await callGroqAI([{ text: "Reply with just: OK" }], "", 0.1);
+
+        if (out) {
+          var scanModeTxt = visModels.length > 0 ? ("Groq Vision: " + visModels[0]) : "Hybrid OCR + Groq AI (Auto)";
+          var okMsg = "✅ Groq AI 100% चालू है! Text AI: " + lastAiModelUsed + " | 3-Photo Scanner: " + scanModeTxt;
+          if (logEl) logEl.textContent = okMsg;
+          showToast(okMsg);
+        } else {
+          var failMsg = "❌ Groq Error: " + (lastAiErr || "Unknown Error");
+          if (logEl) logEl.textContent = failMsg;
+          showToast(failMsg, "error");
+        }
+      };
+    })();
+  </script>
 </body>
 </html>
 <!-- ===== PART 4 END ===== -->
